@@ -1,0 +1,40 @@
+{
+  "name": "web-tarpit",
+  "version": "1.0.0",
+  "description": "Bot trap for any JavaScript server. Fake WordPress pages, honeypot credentials, slow-drip responses. Zero dependencies.",
+  "type": "module",
+  "main": "src/tarpit.js",
+  "exports": {
+    ".": "./src/tarpit.js",
+    "./adapters": "./src/adapters.js"
+  },
+  "files": [
+    "src/tarpit.js",
+    "src/adapters.js",
+    "schema.sql",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "security",
+    "honeypot",
+    "tarpit",
+    "bot-trap",
+    "wordpress",
+    "waf",
+    "cloudflare",
+    "workers",
+    "express",
+    "hono",
+    "nextjs",
+    "deno",
+    "bun"
+  ],
+  "author": "Brian Crumrine <bcrumrin@gmail.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/crumrine/web-tarpit.git"
+  },
+  "homepage": "https://github.com/crumrine/web-tarpit"
+}

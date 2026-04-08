@@ -1,0 +1,8 @@
+name = "tarpit-dashboard"
+main = "src/index.js"
+compatibility_date = "2024-09-25"
+
+[[d1_databases]]
+binding = "TARPIT_DB"
+database_name = "tarpit-logs"
+database_id = "<your-database-id>"
