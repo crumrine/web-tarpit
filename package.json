@@ -36,5 +36,8 @@
     "type": "git",
     "url": "https://github.com/crumrine/web-tarpit.git"
   },
-  "homepage": "https://github.com/crumrine/web-tarpit"
+  "homepage": "https://github.com/crumrine/web-tarpit",
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  }
 }

@@ -29,7 +29,7 @@ const BOT_PATHS = [
 function isBotPath(path) {
   const lower = path.toLowerCase();
   if (lower.startsWith('/wp-')) return true;
-  return BOT_PATHS.some(p => lower === p || lower.startsWith(p));
+  return BOT_PATHS.some(p => lower === p.toLowerCase() || lower.startsWith(p.toLowerCase()));
 }
 
 // --- Fake pages ---
