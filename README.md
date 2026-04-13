@@ -182,7 +182,11 @@ Response headers include `X-Powered-By: PHP/8.2.13` and `Server: Apache/2.4.57` 
 
 ## Dashboard (optional)
 
-The `dashboard/` directory contains a standalone Cloudflare Worker that reads from D1 and serves an analytics dashboard showing trap stats, attack types, top bot IPs, and a 30-day activity chart.
+The `dashboard/` directory contains a standalone Cloudflare Worker that reads from D1 and serves an analytics dashboard showing trap stats, attack types, top bot IPs, and a 30-day activity chart. See [`dashboard/README.md`](dashboard/README.md) for full deploy instructions.
+
+## Built with
+
+Designed and built by [Brian Crumrine](https://github.com/crumrine) with [Claude Code](https://claude.com/claude-code).
 
 ## License
 
