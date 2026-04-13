@@ -6,7 +6,11 @@
   "main": "src/tarpit.js",
   "exports": {
     ".": "./src/tarpit.js",
-    "./adapters": "./src/adapters.js"
+    "./adapters": "./src/adapters.js",
+    "./package.json": "./package.json"
+  },
+  "engines": {
+    "node": ">=18"
   },
   "files": [
     "src/tarpit.js",
@@ -39,5 +43,8 @@
   "homepage": "https://github.com/crumrine/web-tarpit",
   "scripts": {
     "test": "node --test test/*.test.js"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }

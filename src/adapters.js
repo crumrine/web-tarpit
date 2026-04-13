@@ -48,15 +48,21 @@ export function expressTarpit(options = {}) {
 
     if (response.body) {
       const reader = response.body.getReader();
+      const cancel = () => reader.cancel().catch(() => {});
+      if (typeof res.on === 'function') res.on('close', cancel);
       (async () => {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) { res.end(); break; }
-          res.write(value);
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) { res.end(); break; }
+            res.write(value);
+          }
+        } catch {
+          try { res.end(); } catch {}
         }
       })();
     } else {
-      response.text().then(text => res.end(text));
+      response.text().then(text => res.end(text)).catch(() => { try { res.end(); } catch {} });
     }
   };
 }
@@ -95,15 +101,21 @@ export function nodeTarpit(options = {}) {
     res.writeHead(response.status || 200, Object.fromEntries(response.headers));
     if (response.body) {
       const reader = response.body.getReader();
+      const cancel = () => reader.cancel().catch(() => {});
+      if (typeof res.on === 'function') res.on('close', cancel);
       (async () => {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) { res.end(); break; }
-          res.write(value);
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) { res.end(); break; }
+            res.write(value);
+          }
+        } catch {
+          try { res.end(); } catch {}
         }
       })();
     } else {
-      response.text().then(text => res.end(text));
+      response.text().then(text => res.end(text)).catch(() => { try { res.end(); } catch {} });
     }
     return true;
   };

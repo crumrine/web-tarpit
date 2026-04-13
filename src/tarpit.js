@@ -244,11 +244,15 @@ function slowDrip(content, contentType = 'text/plain') {
   const writer = writable.getWriter();
 
   (async () => {
-    for (const chunk of chunks) {
-      await writer.write(encoder.encode(chunk));
-      await new Promise(r => setTimeout(r, 100 + Math.random() * 400));
+    try {
+      for (const chunk of chunks) {
+        await writer.write(encoder.encode(chunk));
+        await new Promise(r => setTimeout(r, 100 + Math.random() * 400));
+      }
+      await writer.close();
+    } catch {
+      try { await writer.abort(); } catch {}
     }
-    await writer.close();
   })();
 
   return new Response(readable, {
@@ -357,11 +361,4 @@ export function tarpit(request, options = {}) {
   return null;
 }
 
-/**
- * Check if a path would trigger the tarpit (without generating a response).
- * Useful for middleware that needs to check before handling.
- *
- * @param {string} path - URL pathname
- * @returns {boolean}
- */
 export { isBotPath };
