@@ -105,7 +105,7 @@ Every web server gets hit by bots scanning for WordPress vulnerabilities, expose
 | `/wp-admin/*` | Infinite admin dashboard maze. 20+ linkable pages. |
 | `/.env*` | Slow-drip fake AWS keys, Stripe secrets, database passwords. ~80s per download. |
 | `/.git/*` | Slow-drip fake git config. |
-| `/xmlrpc.php` | Slow-drip XML-RPC fault. |
+| `/xmlrpc.php` | Slow-drip XML-RPC fault. Opt-in honeypot mode parses POSTs and poisons brute-force databases with fake admin success — see [XML-RPC honeypot mode](#xml-rpc-honeypot-mode-opt-in). |
 | `/phpmyadmin/`, `/admin/`, `/login` | Slow-drip "access denied" with IP warning. |
 | `/shell.php`, `*.sql`, `*.bak` | Slow-drip "incident logged" message. |
 
@@ -119,11 +119,46 @@ Pass an `onTrap` callback to log every trapped request:
 tarpit(request, {
   onTrap: (type, path, ip, request, data) => {
     console.log(`[tarpit] ${type} ${path} from ${ip}`);
-    // type: 'login-page', 'login', 'admin', 'env', 'git', 'xmlrpc', 'wp-probe', 'probe'
-    // data: submitted form data (only for 'login' type)
   }
 });
 ```
+
+Event types in default (`'fault'`) mode: `login-page`, `login`, `admin`, `env`,
+`git`, `wp-probe`, `probe`, `xmlrpc`. Honeypot mode (see below) adds
+`xmlrpc-bruteforce`, `xmlrpc-multicall`, `xmlrpc-pingback`, `xmlrpc-listmethods`.
+
+The `data` argument carries form-decoded values for `login` events and parsed
+XML-RPC details (method name, captured creds, multicall counts, pingback target
+URLs) for the `xmlrpc-*` events. **Note: `login` and `xmlrpc-bruteforce` events
+include plaintext credentials.** If you persist them, your store becomes a
+credential database. Hash the password field if that's not what you want.
+
+## XML-RPC honeypot mode (opt-in)
+
+`/xmlrpc.php` is the most-attacked path in the wild. It's how WordPress
+brute-force tools bundle hundreds of credential attempts into a single HTTP
+request, and it's how attackers turn vulnerable servers into SSRF / DDoS
+reflectors via `pingback.ping`. Set `xmlrpcMode: 'honeypot'` to turn the path
+into an active trap that parses requests and lies back:
+
+```js
+tarpit(request, {
+  xmlrpcMode: 'honeypot',
+  ctx,
+  onTrap: (type, path, ip, request, data) => { /* log to D1, etc. */ },
+});
+```
+
+| Method | Honeypot reply |
+|---|---|
+| `wp.getUsersBlogs`, `wp.getProfile`, `wp.getOptions`, `wp.getPosts`, `wp.getUsers`, `wp.getUser`, `wp.getPages`, `wp.getPage`, `metaWeblog.*`, `blogger.*` | Fake `isAdmin: true` success. Every credential pair the attacker tries appears to "work" — poisons the brute-force database with garbage. |
+| `system.multicall` | Wrapped success array sized to inner call count, capped 1..200. |
+| `pingback.*` | Always a fault. Never returns success — refuses to be used as an SSRF reflector. |
+| `system.listMethods` | Slow-dripped list of ~80 fake WordPress methods. |
+| Anything else | Slow-dripped fault. |
+
+Default mode (`xmlrpcMode: 'fault'`, the 1.0 behavior) returns a slow-dripped
+fault for every `/xmlrpc.php` request and emits a single `xmlrpc` event.
 
 For Cloudflare Workers with D1, pass `ctx` and log to the database:
 
@@ -152,6 +187,8 @@ The D1 schema is in `schema.sql`. A companion analytics dashboard is in `dashboa
 | `request` | `Request` | Web Standard Request object |
 | `options.onTrap` | `function` | Callback: `(type, path, ip, request, data?) => void\|Promise` |
 | `options.ctx` | `object` | Execution context with `waitUntil()` (Cloudflare Workers) |
+| `options.xmlrpcMode` | `'fault' \| 'honeypot'` | Default `'fault'`. `'honeypot'` enables method-aware XML-RPC replies (see above). |
+| `options.slowDripMs` | `number` | Per-chunk drip delay override. Omit for the default 100..500ms jitter. `0` disables drip entirely (testing only). |
 
 Returns `Response` if the path is a bot probe, or `null` if legitimate.
 

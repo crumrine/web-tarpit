@@ -231,24 +231,268 @@ PUSHER_APP_SECRET=${randomString(20, HEX)}
 `;
 }
 
-// --- Slow-drip streaming ---
+// --- XML-RPC dispatch ---
+//
+// Most /xmlrpc.php traffic is brute-force credential checking via
+// wp.getUsersBlogs (often bundled in system.multicall to dodge per-request rate
+// limits) and pingback.ping abuse (SSRF reflection used for DDoS). For the
+// auth-checking methods we always return a fake admin success, poisoning the
+// attacker's credential database. For pingback we always return a fault so we
+// never become a tool in someone else's DDoS chain.
 
-function slowDrip(content, contentType = 'text/plain') {
-  const encoder = new TextEncoder();
-  const chunks = [];
-  for (let i = 0; i < content.length; i += 3) {
-    chunks.push(content.substring(i, i + 3));
+const XMLRPC_FAULT = `<?xml version="1.0" encoding="UTF-8"?>
+<methodResponse>
+  <fault>
+    <value>
+      <struct>
+        <member><name>faultCode</name><value><int>403</int></value></member>
+        <member><name>faultString</name><value><string>XML-RPC services are disabled on this site.</string></value></member>
+      </struct>
+    </value>
+  </fault>
+</methodResponse>`;
+
+const XMLRPC_FAULT_PINGBACK = `<?xml version="1.0" encoding="UTF-8"?>
+<methodResponse>
+  <fault>
+    <value>
+      <struct>
+        <member><name>faultCode</name><value><int>33</int></value></member>
+        <member><name>faultString</name><value><string>Pingback is not enabled on this site.</string></value></member>
+      </struct>
+    </value>
+  </fault>
+</methodResponse>`;
+
+const FAKE_XMLRPC_METHODS = [
+  'system.multicall', 'system.listMethods', 'system.getCapabilities',
+  'demo.addTwoNumbers', 'demo.sayHello',
+  'pingback.ping', 'pingback.extensions.getPingbacks',
+  'mt.publishPost', 'mt.getCategoryList', 'mt.getRecentPostTitles',
+  'mt.getPostCategories', 'mt.setPostCategories', 'mt.supportedMethods',
+  'mt.supportedTextFilters', 'mt.getTrackbackPings',
+  'metaWeblog.newPost', 'metaWeblog.editPost', 'metaWeblog.getPost',
+  'metaWeblog.getRecentPosts', 'metaWeblog.getCategories',
+  'metaWeblog.newMediaObject', 'metaWeblog.deletePost',
+  'metaWeblog.getTemplate', 'metaWeblog.setTemplate', 'metaWeblog.getUsersBlogs',
+  'blogger.getUsersBlogs', 'blogger.getUserInfo', 'blogger.getPost',
+  'blogger.getRecentPosts', 'blogger.newPost', 'blogger.editPost', 'blogger.deletePost',
+  'wp.getUsersBlogs', 'wp.newPost', 'wp.editPost', 'wp.deletePost', 'wp.getPost',
+  'wp.getPosts', 'wp.newTerm', 'wp.editTerm', 'wp.deleteTerm', 'wp.getTerm',
+  'wp.getTerms', 'wp.getTaxonomy', 'wp.getTaxonomies', 'wp.getUser', 'wp.getUsers',
+  'wp.getProfile', 'wp.editProfile', 'wp.getPage', 'wp.getPages', 'wp.newPage',
+  'wp.deletePage', 'wp.editPage', 'wp.getPageList', 'wp.getAuthors',
+  'wp.getCategories', 'wp.getTags', 'wp.newCategory', 'wp.deleteCategory',
+  'wp.suggestCategories', 'wp.uploadFile', 'wp.deleteFile', 'wp.getCommentCount',
+  'wp.getPostStatusList', 'wp.getPageStatusList', 'wp.getPageTemplates',
+  'wp.getOptions', 'wp.setOptions', 'wp.getComment', 'wp.getComments',
+  'wp.deleteComment', 'wp.editComment', 'wp.newComment', 'wp.getCommentStatusList',
+  'wp.getMediaItem', 'wp.getMediaLibrary', 'wp.getPostFormats',
+  'wp.getPostType', 'wp.getPostTypes', 'wp.getRevisions', 'wp.restoreRevision',
+];
+
+// Auth-bearing methods we want to "succeed" for: returning isAdmin=true
+// poisons the attacker's credential database.
+const AUTH_METHOD_RE = /^(wp\.(getUsersBlogs|getProfile|getOptions|getPosts|getUsers|getUser|getPages|getPage)|metaWeblog\.|blogger\.)/;
+
+function extractMethodName(body) {
+  const m = body.match(/<methodName>\s*([^\s<]+)\s*<\/methodName>/);
+  return m ? m[1] : '';
+}
+
+function extractStringValues(body) {
+  const re = /<string>([\s\S]*?)<\/string>/g;
+  const out = [];
+  let m;
+  while ((m = re.exec(body))) out.push(m[1]);
+  return out;
+}
+
+const XML_ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' };
+function xmlEscape(s) { return String(s).replace(/[&<>"']/g, c => XML_ESCAPES[c]); }
+
+// Multicall inner-call count, used identically by classifier (telemetry) and
+// reply builder (response size). Source of truth so the two can't drift.
+//
+// In real XML-RPC, system.multicall takes an array of structs. Each entry's
+// method name is encoded as <member><name>methodName</name>...</member>, NOT
+// as a literal <methodName> tag (that form is reserved for the outer call).
+// Counting <name>methodName</name> matches actual attacker traffic.
+function multicallInnerCount(body) {
+  return (body.match(/<name>\s*methodName\s*<\/name>/g) || []).length;
+}
+
+function fakeUsersBlogsSuccess(host) {
+  const h = xmlEscape(host);
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<methodResponse>
+  <params>
+    <param>
+      <value>
+        <array>
+          <data>
+            <value>
+              <struct>
+                <member><name>isAdmin</name><value><boolean>1</boolean></value></member>
+                <member><name>url</name><value><string>https://${h}/</string></value></member>
+                <member><name>blogid</name><value><string>1</string></value></member>
+                <member><name>blogName</name><value><string>${h}</string></value></member>
+                <member><name>xmlrpc</name><value><string>https://${h}/xmlrpc.php</string></value></member>
+              </struct>
+            </value>
+          </data>
+        </array>
+      </value>
+    </param>
+  </params>
+</methodResponse>`;
+}
+
+function fakeMulticallSuccess(n, host) {
+  const h = xmlEscape(host);
+  const entry = `        <value><array><data><value>
+          <struct>
+            <member><name>isAdmin</name><value><boolean>1</boolean></value></member>
+            <member><name>url</name><value><string>https://${h}/</string></value></member>
+            <member><name>blogid</name><value><string>1</string></value></member>
+            <member><name>blogName</name><value><string>${h}</string></value></member>
+            <member><name>xmlrpc</name><value><string>https://${h}/xmlrpc.php</string></value></member>
+          </struct>
+        </value></data></array></value>`;
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<methodResponse>
+  <params>
+    <param>
+      <value>
+        <array>
+          <data>
+${Array(n).fill(entry).join('\n')}
+          </data>
+        </array>
+      </value>
+    </param>
+  </params>
+</methodResponse>`;
+}
+
+function fakeListMethodsResponse() {
+  const items = FAKE_XMLRPC_METHODS.map(m => `      <value><string>${xmlEscape(m)}</string></value>`).join('\n');
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<methodResponse>
+  <params>
+    <param>
+      <value>
+        <array>
+          <data>
+${items}
+          </data>
+        </array>
+      </value>
+    </param>
+  </params>
+</methodResponse>`;
+}
+
+function classifyXmlrpc(method, body) {
+  if (method === 'system.multicall') {
+    return { type: 'xmlrpc-multicall', data: { method, innerCount: multicallInnerCount(body) } };
   }
+  if (AUTH_METHOD_RE.test(method)) {
+    const strings = extractStringValues(body);
+    const creds = strings.length >= 2
+      ? { username: strings[strings.length - 2], password: strings[strings.length - 1] }
+      : {};
+    return { type: 'xmlrpc-bruteforce', data: { method, ...creds } };
+  }
+  if (method.startsWith('pingback.')) {
+    const strings = extractStringValues(body);
+    return { type: 'xmlrpc-pingback', data: { method, source: strings[0] || '', target: strings[1] || '' } };
+  }
+  if (method === 'system.listMethods') {
+    return { type: 'xmlrpc-listmethods', data: {} };
+  }
+  return { type: 'xmlrpc', data: { method } };
+}
 
+function buildXmlrpcReply(method, body, host) {
+  // Always-success on auth methods is intentional: it floods the attacker's
+  // credential database with garbage rather than leaking which passwords
+  // failed. A more realistic 1-3% sample-success would be harder for time-
+  // based scanners to flag, but at the cost of less poison signal.
+  if (method === 'system.multicall') {
+    // Telemetry logs the real count; response size is clamped 1..200 so a
+    // pathological multicall can't balloon the in-memory string.
+    return fakeMulticallSuccess(Math.max(1, Math.min(multicallInnerCount(body), 200)), host);
+  }
+  if (AUTH_METHOD_RE.test(method)) return fakeUsersBlogsSuccess(host);
+  if (method.startsWith('pingback.')) return XMLRPC_FAULT_PINGBACK;
+  if (method === 'system.listMethods') return fakeListMethodsResponse();
+  return XMLRPC_FAULT;
+}
+
+// --- Slow-drip streaming ---
+//
+// dripMs controls the per-chunk delay:
+//   undefined → 100..500ms random (production default)
+//   number    → fixed delay; 0 short-circuits to a single write (tests)
+
+async function dripWrite(writer, content, dripMs) {
+  const encoder = new TextEncoder();
+  if (dripMs === 0) {
+    await writer.write(encoder.encode(content));
+    return;
+  }
+  for (let i = 0; i < content.length; i += 3) {
+    await writer.write(encoder.encode(content.substring(i, i + 3)));
+    const delay = dripMs !== undefined ? dripMs : 100 + Math.random() * 400;
+    if (delay > 0) await new Promise(r => setTimeout(r, delay));
+  }
+}
+
+const DRIP_HEADERS = {
+  'Transfer-Encoding': 'chunked',
+  'Cache-Control': 'no-store',
+  'X-Powered-By': 'PHP/8.2.13',
+  'Server': 'Apache/2.4.57',
+};
+
+function slowDrip(content, contentType = 'text/plain', dripMs) {
+  const { readable, writable } = new TransformStream();
+  const writer = writable.getWriter();
+  (async () => {
+    try {
+      await dripWrite(writer, content, dripMs);
+      await writer.close();
+    } catch {
+      try { await writer.abort(); } catch {}
+    }
+  })();
+  return new Response(readable, {
+    headers: { 'Content-Type': contentType, ...DRIP_HEADERS },
+  });
+}
+
+function xmlrpcDynamicResponse(request, host, onTrap, ip, ctx, path, dripMs) {
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
 
   (async () => {
+    let body = '';
+    try { body = await request.text(); } catch {}
+
+    const method = extractMethodName(body);
+    const xml = buildXmlrpcReply(method, body, host);
+
+    if (onTrap) {
+      try {
+        const event = classifyXmlrpc(method, body);
+        const p = onTrap(event.type, path, ip, request, event.data);
+        if (p && ctx?.waitUntil) ctx.waitUntil(p);
+      } catch {}
+    }
+
     try {
-      for (const chunk of chunks) {
-        await writer.write(encoder.encode(chunk));
-        await new Promise(r => setTimeout(r, 100 + Math.random() * 400));
-      }
+      await dripWrite(writer, xml, dripMs);
       await writer.close();
     } catch {
       try { await writer.abort(); } catch {}
@@ -256,13 +500,7 @@ function slowDrip(content, contentType = 'text/plain') {
   })();
 
   return new Response(readable, {
-    headers: {
-      'Content-Type': contentType,
-      'Transfer-Encoding': 'chunked',
-      'Cache-Control': 'no-store',
-      'X-Powered-By': 'PHP/8.2.13',
-      'Server': 'Apache/2.4.57',
-    },
+    headers: { 'Content-Type': 'text/xml', ...DRIP_HEADERS },
   });
 }
 
@@ -272,14 +510,35 @@ function slowDrip(content, contentType = 'text/plain') {
  * Bot trap handler. Returns a Response for known bot paths, or null
  * for legitimate requests. Uses the Web Standard Request/Response API.
  *
+ * onTrap event types in 'fault' (default) mode: 'login-page', 'login',
+ * 'admin', 'env', 'git', 'wp-probe', 'probe', 'xmlrpc'.
+ *
+ * 'honeypot' mode adds method-specific xmlrpc events:
+ * 'xmlrpc-bruteforce', 'xmlrpc-multicall', 'xmlrpc-pingback',
+ * 'xmlrpc-listmethods'.
+ *
+ * NOTE: 'login' and 'xmlrpc-bruteforce' events include captured plaintext
+ * credentials in the data argument. If you persist these (D1, KV, logs),
+ * your store becomes a credential database — consider hashing the password
+ * field before storage if that's not intentional.
+ *
  * @param {Request} request - Web Standard Request object
  * @param {object} [options] - Optional configuration
- * @param {function} [options.onTrap] - Callback: (type, path, ip, request) => void
+ * @param {function} [options.onTrap] - Callback: (type, path, ip, request, data?) => void
  * @param {object} [options.ctx] - Execution context with waitUntil (Cloudflare Workers)
+ * @param {'fault'|'honeypot'} [options.xmlrpcMode='fault'] - 'fault' returns a slow-dripped
+ *   XML-RPC fault for every request (1.0 behavior). 'honeypot' parses POST bodies and returns
+ *   method-specific replies: fake admin success for credential-checking methods (poisons
+ *   brute-force attempts), wrapped success arrays for system.multicall, fault for pingback.*
+ *   (never helps SSRF reflection), method list for system.listMethods. Honeypot mode emits
+ *   the 'xmlrpc-*' event types listed above.
+ * @param {number} [options.slowDripMs] - Per-chunk delay override for slow-drip responses.
+ *   Omit for the default 100..500ms random jitter. 0 disables drip delays entirely; intended
+ *   for tests, not production (defeats the trap's purpose).
  * @returns {Response|null}
  */
 export function tarpit(request, options = {}) {
-  const { onTrap, ctx } = options;
+  const { onTrap, ctx, xmlrpcMode = 'fault', slowDripMs } = options;
   const url = new URL(request.url);
   const path = url.pathname;
   const host = url.hostname;
@@ -319,7 +578,7 @@ export function tarpit(request, options = {}) {
       }).catch(() => {});
       if (ctx?.waitUntil) ctx.waitUntil(logPromise);
     }
-    return slowDrip('{"success":false,"data":{"message":"Invalid username or password."}}', 'application/json');
+    return slowDrip('{"success":false,"data":{"message":"Invalid username or password."}}', 'application/json', slowDripMs);
   }
 
   // WordPress admin maze
@@ -331,31 +590,36 @@ export function tarpit(request, options = {}) {
   // .env file
   if (path.startsWith('/.env')) {
     log('env');
-    return slowDrip(fakeEnvContent(), 'text/plain');
+    return slowDrip(fakeEnvContent(), 'text/plain', slowDripMs);
   }
 
   // .git paths
   if (path.startsWith('/.git')) {
     log('git');
-    return slowDrip('[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n[remote "origin"]\n\turl = git@github.com:internal/production-app.git\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n[branch "main"]\n\tremote = origin\n\tmerge = refs/heads/main\n', 'text/plain');
+    return slowDrip('[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n[remote "origin"]\n\turl = git@github.com:internal/production-app.git\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n[branch "main"]\n\tremote = origin\n\tmerge = refs/heads/main\n', 'text/plain', slowDripMs);
   }
 
-  // xmlrpc.php
+  // xmlrpc.php — opt-in honeypot mode parses POST bodies and returns method-
+  // specific replies (fake admin success on auth methods, fault on pingback.*
+  // to refuse SSRF reflection). Default 'fault' mode preserves 1.0 behavior.
   if (path === '/xmlrpc.php') {
+    if (request.method === 'POST' && xmlrpcMode === 'honeypot') {
+      return xmlrpcDynamicResponse(request, host, onTrap, ip, ctx, path, slowDripMs);
+    }
     log('xmlrpc');
-    return slowDrip('<?xml version="1.0" encoding="UTF-8"?>\n<methodResponse>\n  <fault>\n    <value>\n      <struct>\n        <member><name>faultCode</name><value><int>403</int></value></member>\n        <member><name>faultString</name><value><string>XML-RPC services are disabled on this site.</string></value></member>\n      </struct>\n    </value>\n  </fault>\n</methodResponse>', 'text/xml');
+    return slowDrip(XMLRPC_FAULT, 'text/xml', slowDripMs);
   }
 
   // WordPress probes
   if (path.startsWith('/wp-')) {
     log('wp-probe');
-    return slowDrip('<!DOCTYPE html><html><head><title>Loading...</title></head><body><p>Please wait...</p></body></html>', 'text/html');
+    return slowDrip('<!DOCTYPE html><html><head><title>Loading...</title></head><body><p>Please wait...</p></body></html>', 'text/html', slowDripMs);
   }
 
   // Database/config/admin probes
   if (path.endsWith('.sql') || path.endsWith('.bak') || path.includes('config') || path.includes('admin') || path.includes('phpmyadmin') || path.includes('shell') || path.includes('eval')) {
     log('probe');
-    return slowDrip('Access denied.\n\nThis incident has been logged and reported.\nYour IP: ' + ip + '\n', 'text/plain');
+    return slowDrip('Access denied.\n\nThis incident has been logged and reported.\nYour IP: ' + ip + '\n', 'text/plain', slowDripMs);
   }
 
   return null;
