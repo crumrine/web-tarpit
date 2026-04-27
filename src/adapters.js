@@ -3,7 +3,33 @@
 // The core tarpit uses Web Standard Request/Response.
 // These adapters bridge frameworks that use different APIs.
 
+import { Readable } from 'node:stream';
 import { tarpit, isBotPath } from './tarpit.js';
+
+// Forward the Node request body into the Web Request the core consumes.
+// Without this, downstream paths that read the body (xmlrpc honeypot,
+// admin-ajax credential capture) see an empty string.
+//
+// Express middleware ordering: install expressTarpit BEFORE body parsers
+// (express.json, express.urlencoded, etc.) so the raw stream is still
+// readable. If a parser ran first and populated req.body, we re-serialize
+// it as a fallback so the body still reaches the trap.
+function attachBody(init, nodeReq) {
+  const method = nodeReq.method;
+  if (method === 'GET' || method === 'HEAD') return;
+  if (nodeReq.body !== undefined && nodeReq.body !== null) {
+    if (typeof nodeReq.body === 'string' || nodeReq.body instanceof Uint8Array) {
+      init.body = nodeReq.body;
+    } else {
+      init.body = JSON.stringify(nodeReq.body);
+    }
+    return;
+  }
+  if (typeof nodeReq.pipe === 'function' && nodeReq.readable !== false) {
+    init.body = Readable.toWeb(nodeReq);
+    init.duplex = 'half';
+  }
+}
 
 /**
  * Express/Connect middleware adapter.
@@ -32,10 +58,9 @@ export function expressTarpit(options = {}) {
       if (value) headers.set(key, Array.isArray(value) ? value[0] : value);
     }
 
-    const webRequest = new Request(url, {
-      method: req.method,
-      headers,
-    });
+    const init = { method: req.method, headers };
+    attachBody(init, req);
+    const webRequest = new Request(url, init);
 
     const response = tarpit(webRequest, options);
     if (!response) return next();
@@ -94,7 +119,9 @@ export function nodeTarpit(options = {}) {
       if (value) headers.set(key, Array.isArray(value) ? value[0] : value);
     }
 
-    const webRequest = new Request(url, { method: req.method, headers });
+    const init = { method: req.method, headers };
+    attachBody(init, req);
+    const webRequest = new Request(url, init);
     const response = tarpit(webRequest, options);
     if (!response) return false;
 

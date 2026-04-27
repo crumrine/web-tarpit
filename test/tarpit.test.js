@@ -298,6 +298,292 @@ describe('tarpit() response generation', () => {
 });
 
 // ---------------------------------------------------------------------------
+// 2b. xmlrpc.php POST dispatch (method-aware dynamic honeypot)
+// ---------------------------------------------------------------------------
+
+function makeXmlrpcRequest(body) {
+  return new Request('https://example.com/xmlrpc.php', {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/xml' },
+    body,
+  });
+}
+
+function xmlBody(method, ...params) {
+  return `<?xml version="1.0"?><methodCall><methodName>${method}</methodName><params>${params.join('')}</params></methodCall>`;
+}
+
+function strParam(val) {
+  return `<param><value><string>${val}</string></value></param>`;
+}
+
+function intParam(val) {
+  return `<param><value><int>${val}</int></value></param>`;
+}
+
+// All tests in this block run with xmlrpcMode:'honeypot' (opt-in, off by
+// default for backwards compat) and slowDripMs:0 to skip drip delays.
+const honeypot = (req, extra = {}) =>
+  tarpit(req, { xmlrpcMode: 'honeypot', slowDripMs: 0, ...extra });
+
+describe('xmlrpc.php opt-in gate (default fault mode)', () => {
+  it('POST without xmlrpcMode option returns a fault, NOT honeypot success', async () => {
+    const req = makeXmlrpcRequest(xmlBody('wp.getUsersBlogs', strParam('admin'), strParam('hunter2')));
+    const response = tarpit(req, { slowDripMs: 0 });
+    const text = await response.text();
+    assert.ok(text.includes('<fault>'), 'default mode must return fault');
+    assert.ok(!text.includes('<boolean>1</boolean>'), 'default mode must not return honeypot success');
+  });
+
+  it('POST without xmlrpcMode fires onTrap with legacy type xmlrpc, not xmlrpc-bruteforce', async () => {
+    let capturedType = null;
+    const req = makeXmlrpcRequest(xmlBody('wp.getUsersBlogs', strParam('admin'), strParam('hunter2')));
+    tarpit(req, {
+      slowDripMs: 0,
+      onTrap: (type) => { capturedType = type; },
+    });
+    assert.equal(capturedType, 'xmlrpc');
+  });
+
+  it('xmlrpcMode:"fault" is the explicit equivalent of the default', async () => {
+    const req = makeXmlrpcRequest(xmlBody('wp.getUsersBlogs', strParam('a'), strParam('b')));
+    const response = tarpit(req, { xmlrpcMode: 'fault', slowDripMs: 0 });
+    const text = await response.text();
+    assert.ok(text.includes('<fault>'));
+    assert.ok(!text.includes('<boolean>1</boolean>'));
+  });
+});
+
+describe('xmlrpc.php POST dispatch (honeypot mode)', () => {
+  // 1. wp.getUsersBlogs returns fake admin success
+  it('wp.getUsersBlogs returns fake admin success with correct content', async () => {
+    const req = makeXmlrpcRequest(xmlBody('wp.getUsersBlogs', strParam('admin'), strParam('hunter2')));
+    const response = honeypot(req);
+    const text = await response.text();
+    assert.match(text, /<boolean>1<\/boolean>/);
+    assert.ok(text.includes('isAdmin'));
+    assert.ok(text.includes('example.com'));
+    assert.match(response.headers.get('content-type'), /text\/xml/);
+  });
+
+  // 2. wp.getUsersBlogs fires onTrap with creds
+  it('wp.getUsersBlogs fires onTrap with type xmlrpc-bruteforce and extracts username/password', async () => {
+    let captured = null;
+    const req = makeXmlrpcRequest(xmlBody('wp.getUsersBlogs', strParam('admin'), strParam('hunter2')));
+    const response = honeypot(req, {
+      onTrap: (type, path, ip, request, data) => { captured = { type, data }; },
+    });
+    await response.text();
+    assert.ok(captured, 'onTrap was not called');
+    assert.equal(captured.type, 'xmlrpc-bruteforce');
+    assert.equal(captured.data.method, 'wp.getUsersBlogs');
+    assert.equal(captured.data.username, 'admin');
+    assert.equal(captured.data.password, 'hunter2');
+  });
+
+  // 3. wp.getProfile with 3 params extracts trailing two strings as creds
+  it('wp.getProfile with 3 params (blog_id, user, pass) extracts trailing two strings as creds', async () => {
+    let captured = null;
+    const body = `<?xml version="1.0"?><methodCall><methodName>wp.getProfile</methodName><params>${intParam(1)}${strParam('admin')}${strParam('hunter2')}</params></methodCall>`;
+    const req = makeXmlrpcRequest(body);
+    const response = honeypot(req, {
+      onTrap: (type, path, ip, request, data) => { captured = data; },
+    });
+    await response.text();
+    assert.ok(captured, 'onTrap was not called');
+    assert.equal(captured.username, 'admin');
+    assert.equal(captured.password, 'hunter2');
+  });
+
+  // 4. metaWeblog.* treated as bruteforce
+  it('metaWeblog.getUsersBlogs fires onTrap with type xmlrpc-bruteforce', async () => {
+    let capturedType = null;
+    const req = makeXmlrpcRequest(xmlBody('metaWeblog.getUsersBlogs', strParam('admin'), strParam('hunter2')));
+    const response = honeypot(req, {
+      onTrap: (type) => { capturedType = type; },
+    });
+    await response.text();
+    assert.equal(capturedType, 'xmlrpc-bruteforce');
+  });
+
+  // Real XML-RPC multicall encodes each inner call as a struct with a
+  // <member><name>methodName</name>...</member> member, NOT a literal
+  // <methodName> tag.
+  function multicallEntry(method, ...stringParams) {
+    const params = stringParams.map(s => `<value><string>${s}</string></value>`).join('');
+    return `<value><struct>` +
+      `<member><name>methodName</name><value><string>${method}</string></value></member>` +
+      `<member><name>params</name><value><array><data>${params}</data></array></value></member>` +
+      `</struct></value>`;
+  }
+  function multicallBody(...entries) {
+    return `<?xml version="1.0"?><methodCall><methodName>system.multicall</methodName>` +
+      `<params><param><value><array><data>${entries.join('')}</data></array></value></param></params>` +
+      `</methodCall>`;
+  }
+
+  // 5. system.multicall returns success array sized to inner count
+  it('system.multicall returns success array with one entry per inner call', async () => {
+    const body = multicallBody(
+      multicallEntry('wp.getUsersBlogs', 'admin', 'pass1'),
+      multicallEntry('wp.getUsersBlogs', 'admin', 'pass2'),
+    );
+    const req = makeXmlrpcRequest(body);
+    const response = honeypot(req);
+    const text = await response.text();
+    const count = (text.match(/isAdmin/g) || []).length;
+    assert.equal(count, 2);
+  });
+
+  // 6. system.multicall fires onTrap with innerCount
+  it('system.multicall fires onTrap with type xmlrpc-multicall and innerCount=2', async () => {
+    let captured = null;
+    const body = multicallBody(
+      multicallEntry('wp.getUsersBlogs', 'admin', 'pass1'),
+      multicallEntry('wp.getUsersBlogs', 'admin', 'pass2'),
+    );
+    const req = makeXmlrpcRequest(body);
+    const response = honeypot(req, {
+      onTrap: (type, path, ip, request, data) => { captured = { type, data }; },
+    });
+    await response.text();
+    assert.ok(captured, 'onTrap was not called');
+    assert.equal(captured.type, 'xmlrpc-multicall');
+    assert.equal(captured.data.innerCount, 2);
+  });
+
+  // 7. system.multicall with zero inner calls still produces a response (min 1)
+  it('system.multicall with zero inner calls still produces at least one entry', async () => {
+    const body = `<?xml version="1.0"?><methodCall><methodName>system.multicall</methodName><params></params></methodCall>`;
+    const req = makeXmlrpcRequest(body);
+    const response = honeypot(req);
+    const text = await response.text();
+    assert.ok(text.includes('isAdmin'), 'expected at least one isAdmin entry in multicall response');
+  });
+
+  // 8. pingback.ping returns fault, NOT success
+  it('pingback.ping returns fault response with faultCode 33 and never returns success', async () => {
+    const body = xmlBody('pingback.ping', strParam('http://attacker/source'), strParam('http://victim/target'));
+    const req = makeXmlrpcRequest(body);
+    const response = honeypot(req);
+    const text = await response.text();
+    assert.ok(text.includes('<fault>'), 'expected <fault> in pingback response');
+    assert.ok(text.includes('Pingback is not enabled'), 'expected pingback fault string');
+    assert.ok(!text.includes('<boolean>1</boolean>'), 'pingback must never return success');
+  });
+
+  // 9. pingback.ping fires onTrap with source and target
+  it('pingback.ping fires onTrap with type xmlrpc-pingback and correct source/target', async () => {
+    let captured = null;
+    const body = xmlBody('pingback.ping', strParam('http://attacker/source'), strParam('http://victim/target'));
+    const req = makeXmlrpcRequest(body);
+    const response = honeypot(req, {
+      onTrap: (type, path, ip, request, data) => { captured = { type, data }; },
+    });
+    await response.text();
+    assert.ok(captured, 'onTrap was not called');
+    assert.equal(captured.type, 'xmlrpc-pingback');
+    assert.equal(captured.data.source, 'http://attacker/source');
+    assert.equal(captured.data.target, 'http://victim/target');
+  });
+
+  // 9b. pingback.extensions.* (sub-namespace) also returns fault
+  it('pingback.extensions.getPingbacks returns fault and never success', async () => {
+    const body = xmlBody('pingback.extensions.getPingbacks', strParam('http://attacker/url'));
+    const req = makeXmlrpcRequest(body);
+    const response = honeypot(req);
+    const text = await response.text();
+    assert.ok(text.includes('<fault>'), 'expected <fault> for pingback.extensions');
+    assert.ok(!text.includes('<boolean>1</boolean>'), 'pingback.extensions must never return success');
+  });
+
+  // 10. system.listMethods returns method list
+  it('system.listMethods returns a list containing wp.getUsersBlogs and pingback.ping', async () => {
+    const body = xmlBody('system.listMethods');
+    const req = makeXmlrpcRequest(body);
+    const response = honeypot(req);
+    const text = await response.text();
+    assert.ok(text.includes('wp.getUsersBlogs'), 'expected wp.getUsersBlogs in method list');
+    assert.ok(text.includes('pingback.ping'), 'expected pingback.ping in method list');
+    assert.ok(!text.includes('<fault>'), 'listMethods should not return a fault');
+  });
+
+  // 11. system.listMethods fires onTrap
+  it('system.listMethods fires onTrap with type xmlrpc-listmethods', async () => {
+    let capturedType = null;
+    const body = xmlBody('system.listMethods');
+    const req = makeXmlrpcRequest(body);
+    const response = honeypot(req, {
+      onTrap: (type) => { capturedType = type; },
+    });
+    await response.text();
+    assert.equal(capturedType, 'xmlrpc-listmethods');
+  });
+
+  // 12. Unknown method falls back to fault
+  it('unknown method wp.totallyMadeUp returns a fault and fires onTrap with type xmlrpc', async () => {
+    let captured = null;
+    const body = xmlBody('wp.totallyMadeUp', strParam('admin'), strParam('pass'));
+    const req = makeXmlrpcRequest(body);
+    const response = honeypot(req, {
+      onTrap: (type, path, ip, request, data) => { captured = { type, data }; },
+    });
+    const text = await response.text();
+    assert.ok(text.includes('<fault>'), 'expected <fault> for unknown method');
+    assert.ok(captured, 'onTrap was not called');
+    assert.equal(captured.type, 'xmlrpc');
+    assert.equal(captured.data.method, 'wp.totallyMadeUp');
+  });
+
+  // 13. Empty body falls back to fault without crashing
+  it('empty body falls back to fault without throwing', async () => {
+    const req = makeXmlrpcRequest('');
+    const response = honeypot(req);
+    const text = await response.text();
+    assert.ok(text.includes('<fault>'), 'expected <fault> for empty body');
+  });
+
+  // 14. POST response uses streaming headers
+  it('POST response has streaming headers: Transfer-Encoding, X-Powered-By, Server', () => {
+    const req = makeXmlrpcRequest(xmlBody('wp.getUsersBlogs', strParam('a'), strParam('b')));
+    const response = honeypot(req);
+    assert.equal(response.headers.get('transfer-encoding'), 'chunked');
+    assert.equal(response.headers.get('x-powered-by'), 'PHP/8.2.13');
+    assert.equal(response.headers.get('server'), 'Apache/2.4.57');
+    response.body.cancel();
+  });
+
+  // 15. POST response is a Response synchronously (not a Promise)
+  it('tarpit() returns a Response synchronously for POST to xmlrpc.php', () => {
+    const req = makeXmlrpcRequest(xmlBody('wp.getUsersBlogs', strParam('a'), strParam('b')));
+    const response = honeypot(req);
+    assert.ok(response instanceof Response);
+    response.body.cancel();
+  });
+
+  // 16. GET still calls onTrap with type='xmlrpc' (regression)
+  it('GET to xmlrpc.php still fires onTrap with type xmlrpc', () => {
+    let capturedType = null;
+    const req = makeRequest('/xmlrpc.php', { method: 'GET' });
+    honeypot(req, { onTrap: (type) => { capturedType = type; } });
+    assert.equal(capturedType, 'xmlrpc');
+  });
+
+  // 17. ctx.waitUntil receives onTrap promise for POST
+  it('ctx.waitUntil is called with a Promise when onTrap returns a Promise', async () => {
+    let waitUntilArg = null;
+    const ctx = { waitUntil: (p) => { waitUntilArg = p; } };
+    const req = makeXmlrpcRequest(xmlBody('wp.getUsersBlogs', strParam('a'), strParam('b')));
+    const response = honeypot(req, {
+      ctx,
+      onTrap: async () => { /* async onTrap returns a Promise */ },
+    });
+    await response.text();
+    assert.ok(waitUntilArg instanceof Promise, 'ctx.waitUntil should have received a Promise');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 3. onTrap callback
 // ---------------------------------------------------------------------------
 
@@ -715,5 +1001,116 @@ describe('nodeTarpit()', () => {
     const result = trap(req, res);
     assert.equal(result, true);
     assert.ok(headWritten);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Adapter body forwarding (regression: adapters used to drop POST bodies,
+// breaking xmlrpc honeypot and admin-ajax credential capture)
+// ---------------------------------------------------------------------------
+
+import { Readable } from 'node:stream';
+
+function noopRes() {
+  return { writeHead() {}, setHeader() {}, status() { return this; }, write() {}, end() {}, on() {} };
+}
+
+// Wait for the async streamer inside xmlrpcDynamicResponse to finish reading
+// the body and fire onTrap. Polls because the adapter returns synchronously
+// while the body parsing happens on a microtask queue.
+async function waitFor(predicate, ms = 2000) {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise(r => setTimeout(r, 5));
+  }
+  throw new Error('waitFor: predicate never became true');
+}
+
+describe('adapter body forwarding', () => {
+  const xmlrpcBody = `<?xml version="1.0"?><methodCall><methodName>wp.getUsersBlogs</methodName><params><param><value><string>admin</string></value></param><param><value><string>hunter2</string></value></param></params></methodCall>`;
+
+  it('nodeTarpit forwards a streamed POST body to the xmlrpc honeypot', async () => {
+    let captured = null;
+    const trap = nodeTarpit({
+      xmlrpcMode: 'honeypot',
+      slowDripMs: 0,
+      onTrap: (type, path, ip, req, data) => { captured = { type, data }; },
+    });
+    const req = Object.assign(Readable.from([Buffer.from(xmlrpcBody)]), {
+      url: '/xmlrpc.php',
+      method: 'POST',
+      headers: { host: 'example.com', 'content-type': 'text/xml' },
+    });
+    assert.equal(trap(req, noopRes()), true);
+    await waitFor(() => captured !== null);
+    assert.equal(captured.type, 'xmlrpc-bruteforce');
+    assert.equal(captured.data.username, 'admin');
+    assert.equal(captured.data.password, 'hunter2');
+  });
+
+  it('expressTarpit forwards a streamed POST body to the xmlrpc honeypot', async () => {
+    let captured = null;
+    const mw = expressTarpit({
+      xmlrpcMode: 'honeypot',
+      slowDripMs: 0,
+      onTrap: (type, path, ip, req, data) => { captured = { type, data }; },
+    });
+    const req = Object.assign(Readable.from([Buffer.from(xmlrpcBody)]), {
+      path: '/xmlrpc.php',
+      url: '/xmlrpc.php',
+      originalUrl: '/xmlrpc.php',
+      method: 'POST',
+      protocol: 'https',
+      headers: { host: 'example.com', 'content-type': 'text/xml' },
+      get: (k) => req.headers[k.toLowerCase()] || null,
+    });
+    mw(req, noopRes(), () => assert.fail('next() should not be called for bot path'));
+    await waitFor(() => captured !== null);
+    assert.equal(captured.type, 'xmlrpc-bruteforce');
+    assert.equal(captured.data.username, 'admin');
+    assert.equal(captured.data.password, 'hunter2');
+  });
+
+  it('expressTarpit forwards req.body=string when body-parser ran first', async () => {
+    let captured = null;
+    const mw = expressTarpit({
+      xmlrpcMode: 'honeypot',
+      slowDripMs: 0,
+      onTrap: (type, path, ip, req, data) => { captured = { type, data }; },
+    });
+    const req = {
+      path: '/xmlrpc.php',
+      url: '/xmlrpc.php',
+      originalUrl: '/xmlrpc.php',
+      method: 'POST',
+      protocol: 'https',
+      headers: { host: 'example.com', 'content-type': 'text/xml' },
+      get: function(k) { return this.headers[k.toLowerCase()] || null; },
+      body: xmlrpcBody, // pre-parsed by raw-body middleware
+    };
+    mw(req, noopRes(), () => assert.fail('next() should not be called for bot path'));
+    await waitFor(() => captured !== null);
+    assert.equal(captured.type, 'xmlrpc-bruteforce');
+    assert.equal(captured.data.username, 'admin');
+    assert.equal(captured.data.password, 'hunter2');
+  });
+
+  it('nodeTarpit forwards a streamed POST body to admin-ajax credential capture', async () => {
+    let captured = null;
+    const trap = nodeTarpit({
+      onTrap: (type, path, ip, req, data) => { if (type === 'login') captured = { type, data }; },
+    });
+    const loginPayload = JSON.stringify({ u: 'admin', p: 'hunter2', t: 1 });
+    const req = Object.assign(Readable.from([Buffer.from(loginPayload)]), {
+      url: '/wp-admin/admin-ajax.php',
+      method: 'POST',
+      headers: { host: 'example.com', 'content-type': 'application/json' },
+    });
+    assert.equal(trap(req, noopRes()), true);
+    await waitFor(() => captured !== null);
+    assert.equal(captured.type, 'login');
+    assert.equal(captured.data.u, 'admin');
+    assert.equal(captured.data.p, 'hunter2');
   });
 });

@@ -1,6 +1,6 @@
 {
   "name": "web-tarpit",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Bot trap for any JavaScript server. Fake WordPress pages, honeypot credentials, slow-drip responses. Zero dependencies.",
   "type": "module",
   "main": "src/tarpit.js",
