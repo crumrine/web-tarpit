@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.1] - 2026-05-01
+
+Republish of 1.1.0 — no functional changes. The 1.1.0 publish attempt failed
+on an unauthenticated npm session and was never pushed to the registry, so
+this is the first version of the XML-RPC honeypot work to actually ship.
+
+[1.1.1]: https://github.com/crumrine/web-tarpit/releases/tag/v1.1.1
+
 ## [1.1.0] - 2026-04-26
 
 ### Added
