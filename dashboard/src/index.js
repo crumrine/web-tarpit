@@ -26,46 +26,50 @@ export default {
 };
 
 async function handleApiStats(env) {
+  // Migrated 2026-05-14 from tarpit_log to tarpit_rollup. tarpit_rollup is
+  // bucket-aggregated (PK: site,type,ip,hour_bucket; `count` for repeats),
+  // so every COUNT(*) becomes SUM(count). See DEV-323.
   const queries = await Promise.all([
-    env.TARPIT_DB.prepare("SELECT COUNT(*) as total FROM tarpit_log").first(),
-    env.TARPIT_DB.prepare("SELECT COUNT(DISTINCT ip) as unique_ips FROM tarpit_log").first(),
-    env.TARPIT_DB.prepare("SELECT COUNT(DISTINCT site) as sites FROM tarpit_log").first(),
+    env.TARPIT_DB.prepare("SELECT SUM(count) as total FROM tarpit_rollup").first(),
+    env.TARPIT_DB.prepare("SELECT COUNT(DISTINCT ip) as unique_ips FROM tarpit_rollup").first(),
+    env.TARPIT_DB.prepare("SELECT COUNT(DISTINCT site) as sites FROM tarpit_rollup").first(),
     env.TARPIT_DB.prepare(`
-      SELECT type, COUNT(*) as count FROM tarpit_log
+      SELECT type, SUM(count) as count FROM tarpit_rollup
       GROUP BY type ORDER BY count DESC
     `).all(),
     env.TARPIT_DB.prepare(`
-      SELECT DATE(ts) as day, COUNT(*) as count FROM tarpit_log
-      WHERE ts >= datetime('now', '-30 days')
-      GROUP BY DATE(ts) ORDER BY day
+      SELECT DATE(hour_bucket) as day, SUM(count) as count FROM tarpit_rollup
+      WHERE hour_bucket >= datetime('now', '-30 days')
+      GROUP BY DATE(hour_bucket) ORDER BY day
     `).all(),
     env.TARPIT_DB.prepare(`
-      SELECT site, COUNT(*) as count FROM tarpit_log
+      SELECT site, SUM(count) as count FROM tarpit_rollup
       GROUP BY site ORDER BY count DESC LIMIT 20
     `).all(),
     env.TARPIT_DB.prepare(`
-      SELECT ip, COUNT(*) as count FROM tarpit_log
+      SELECT ip, SUM(count) as count FROM tarpit_rollup
       GROUP BY ip ORDER BY count DESC LIMIT 20
     `).all(),
     env.TARPIT_DB.prepare(`
-      SELECT path, COUNT(*) as count FROM tarpit_log
+      SELECT path, SUM(count) as count FROM tarpit_rollup
       GROUP BY path ORDER BY count DESC LIMIT 20
     `).all(),
-    // Estimate wasted time: each slow-drip averages ~15s, login pages ~10s idle
+    // Estimate wasted time: each slow-drip averages ~15s, login pages ~10s idle.
+    // Multiply per-bucket time by count to recover per-probe estimate.
     env.TARPIT_DB.prepare(`
       SELECT
-        SUM(CASE WHEN type IN ('env','git','xmlrpc','wp-probe','probe') THEN 15
-                  WHEN type = 'login' THEN 12
-                  WHEN type = 'admin' THEN 5
-                  ELSE 8 END) as wasted_seconds
-      FROM tarpit_log
+        SUM(count * CASE WHEN type IN ('env','git','xmlrpc','wp-probe','probe') THEN 15
+                          WHEN type = 'login' THEN 12
+                          WHEN type = 'admin' THEN 5
+                          ELSE 8 END) as wasted_seconds
+      FROM tarpit_rollup
     `).first(),
     env.TARPIT_DB.prepare(`
-      SELECT COUNT(*) as today FROM tarpit_log
-      WHERE ts >= datetime('now', '-24 hours')
+      SELECT SUM(count) as today FROM tarpit_rollup
+      WHERE last_ts >= datetime('now', '-24 hours')
     `).first(),
     env.TARPIT_DB.prepare(`
-      SELECT MIN(ts) as first_log FROM tarpit_log
+      SELECT MIN(first_ts) as first_log FROM tarpit_rollup
     `).first(),
   ]);
 
@@ -102,11 +106,14 @@ async function handleApiRecent(env, url) {
 }
 
 async function handleApiSites(env) {
+  // Aggregate from tarpit_rollup. Raw per-event detail lives in
+  // tarpit_log and is served by handleApiRecent (which uses the
+  // (site, ts) index — point-lookup, stays cheap).
   const results = await env.TARPIT_DB.prepare(`
-    SELECT site, COUNT(*) as total,
+    SELECT site, SUM(count) as total,
            COUNT(DISTINCT ip) as unique_ips,
-           MAX(ts) as last_hit
-    FROM tarpit_log GROUP BY site ORDER BY total DESC
+           MAX(last_ts) as last_hit
+    FROM tarpit_rollup GROUP BY site ORDER BY total DESC
   `).all();
   return Response.json(results?.results || []);
 }
